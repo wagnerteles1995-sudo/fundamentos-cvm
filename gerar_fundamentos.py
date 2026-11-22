@@ -88,6 +88,8 @@ def ler_demonstracoes(z, tipo, sufixo):
         return dados, cad
     for r in linhas(z, nome):
         escala = 1000.0 if r.get("ESCALA_MOEDA", "").upper() == "MIL" else 1.0
+        if r["CD_CONTA"].startswith("3.99"):  # lucro por ação já vem em reais por ação
+            escala = 1.0
         v = num(r["VL_CONTA"])
         ordem = "t" if r["ORDEM_EXERC"].startswith("Ú") or r["ORDEM_EXERC"].startswith("U") else "t1"
         dados.setdefault(r["CNPJ_CIA"], {}).setdefault(ordem, {})[r["CD_CONTA"]] = (
@@ -133,6 +135,9 @@ def extrair(bpa, bpp, dre, dfc, dva):
         "patrimonioLiquido": valor_por_descricao(bpp, "2.", r"^Patrim.nio L.quido"),
         "capitalSocial": _capital(bpp),
         "fco": valor(dfc, "6.01"),
+        "_lucroControladores": valor(dre, "3.11.01") or valor(dre, "3.09.01"),
+        "_lpaBasico": max([abs(v) for cd, (ds, v) in dre.items()
+                           if cd.startswith("3.99.01.") and v] or [0]) or None,
     }
 
 
@@ -176,33 +181,68 @@ def ler_setores(z):
 
 # ----------------------------------------------------------------------------- principal
 def gerar(z_dfp, ano_dfp, mod_dfp, z_fca, ano_fca, mod_fca, z_fca_anterior=None):
-    empresas = {}
-    for sufixo in ("con", "ind"):  # consolidado tem prioridade
-        bpa, cad = ler_demonstracoes(z_dfp, "BPA", sufixo)
-        bpp, _ = ler_demonstracoes(z_dfp, "BPP", sufixo)
-        dre, _ = ler_demonstracoes(z_dfp, "DRE", sufixo)
-        dfc, _ = ler_demonstracoes(z_dfp, "DFC_MI", sufixo)
-        dfc_md, _ = ler_demonstracoes(z_dfp, "DFC_MD", sufixo)
-        dva, _ = ler_demonstracoes(z_dfp, "DVA", sufixo)
-        for cnpj, por_ordem in bpa.items():
-            if cnpj in empresas or "t" not in por_ordem:
-                continue
-            reg = {"nome": cad[cnpj]["nome"], "cd_cvm": cad[cnpj]["cd_cvm"],
-                   "demonstracao": "consolidada" if sufixo == "con" else "individual",
-                   "estrutura": tipo_estrutura(por_ordem["t"]),
-                   "exercicio_t": cad[cnpj]["fim"][:4]}
-            for ordem in ("t", "t1"):
-                g = lambda d: d.get(cnpj, {}).get(ordem, {})  # noqa: E731
-                fluxo = g(dfc) or g(dfc_md)
-                reg["contas_" + ordem] = extrair(g(bpa), g(bpp), g(dre), fluxo, g(dva))
-            empresas[cnpj] = reg
+    dem = {}
+    for sufixo in ("con", "ind"):
+        d = {}
+        for tipo in ("BPA", "BPP", "DRE", "DFC_MI", "DFC_MD", "DVA"):
+            d[tipo], cad = ler_demonstracoes(z_dfp, tipo, sufixo)
+            if tipo == "BPA":
+                d["cad"] = cad
+        dem[sufixo] = d
+
+    def preenchida(d, cnpj):
+        """Demonstração utilizável: ativo total e receita/resultado diferentes de zero no exercício t."""
+        bpa = d["BPA"].get(cnpj, {}).get("t", {})
+        dre = d["DRE"].get(cnpj, {}).get("t", {})
+        return bool(valor(bpa, "1")) and any(v for cd, (ds, v) in dre.items() if cd.count(".") == 1)
+
+    empresas, lucro_ctrl, lpa = {}, {}, {}
+    cnpjs = set(dem["con"]["BPA"]) | set(dem["ind"]["BPA"])
+    for cnpj in cnpjs:
+        # lucro atribuído aos controladores e lucro por ação básico (para conferir a unidade das ações)
+        for sufixo in ("ind", "con"):
+            dre_t = dem[sufixo]["DRE"].get(cnpj, {}).get("t", {})
+            l = valor_por_descricao(dre_t, "3.", r"^Lucro.{0,3}Preju") if sufixo == "ind" else valor(dre_t, "3.11.01")
+            p = max([abs(v) for cd, (ds, v) in dre_t.items() if cd.startswith("3.99.01.") and v] or [0])
+            if l and p and cnpj not in lpa:
+                lucro_ctrl[cnpj], lpa[cnpj] = l, p
+
+        # consolidado tem prioridade, desde que esteja preenchido
+        sufixo = "con" if preenchida(dem["con"], cnpj) else ("ind" if preenchida(dem["ind"], cnpj) else None)
+        if not sufixo:
+            continue
+        d = dem[sufixo]
+        cad = d["cad"][cnpj]
+        reg = {"nome": cad["nome"], "cd_cvm": cad["cd_cvm"],
+               "demonstracao": "consolidada" if sufixo == "con" else "individual",
+               "estrutura": tipo_estrutura(d["BPA"][cnpj]["t"]),
+               "exercicio_t": cad["fim"][:4]}
+        for ordem in ("t", "t1"):
+            g = lambda tipo: d[tipo].get(cnpj, {}).get(ordem, {})  # noqa: E731
+            reg["contas_" + ordem] = extrair(g("BPA"), g("BPP"), g("DRE"), g("DFC_MI") or g("DFC_MD"), g("DVA"))
+            reg["contas_" + ordem].pop("_lucroControladores", None)
+            reg["contas_" + ordem].pop("_lpaBasico", None)
+        empresas[cnpj] = reg
 
     for r in linhas(z_dfp, nome_arquivo(z_dfp, "composicao_capital")):
         e = empresas.get(r["CNPJ_CIA"])
-        if e:
-            total = num(r["QT_ACAO_TOTAL_CAP_INTEGR"]) or 0
-            tesouro = num(r["QT_ACAO_TOTAL_TESOURO"]) or 0
-            e["acoes_em_circulacao"] = total - tesouro
+        if not e:
+            continue
+        qtd = (num(r["QT_ACAO_TOTAL_CAP_INTEGR"]) or 0) - (num(r["QT_ACAO_TOTAL_TESOURO"]) or 0)
+        # Algumas companhias informam a quantidade de ações em milhares (sem indicar a unidade).
+        # Conferência: ações implícitas = lucro dos controladores / lucro por ação básico.
+        l, p = lucro_ctrl.get(r["CNPJ_CIA"]), lpa.get(r["CNPJ_CIA"])
+        e["acoes_ajuste"] = "nenhum"
+        if qtd and l and p:
+            razao = (abs(l) / p) / qtd
+            if 300 <= razao <= 3000:
+                qtd *= 1000
+                e["acoes_ajuste"] = "multiplicado por 1000 (informado em milhares)"
+            elif not 0.3 <= razao <= 3:
+                e["acoes_ajuste"] = "verificar: quantidade de ações inconsistente com o lucro por ação"
+        elif qtd:
+            e["acoes_ajuste"] = "não verificado (sem lucro por ação)"
+        e["acoes_em_circulacao"] = qtd or None
 
     setores = ler_setores(z_fca_anterior) if z_fca_anterior else {}
     setores.update(ler_setores(z_fca))
@@ -225,7 +265,7 @@ def gerar(z_dfp, ano_dfp, mod_dfp, z_fca, ano_fca, mod_fca, z_fca_anterior=None)
             "unidade": "reais",
         },
         "tickers": dict(sorted(tickers.items())),
-        "empresas": empresas,
+        "empresas": dict(sorted(empresas.items())),
     }
 
 
