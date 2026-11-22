@@ -132,6 +132,9 @@ def extrair(bpa, bpp, dre, dfc, dva):
         "passivoNaoCirculante": valor(bpp, "2.02"),
         "emprestimosCP": valor(bpp, "2.01.04"),
         "emprestimosLP": valor(bpp, "2.02.01"),
+        # empréstimos, financiamentos e debêntures registrados fora das contas padrão
+        "emprestimosOutrosCP": _dividas_fora_padrao(bpp, "2.01.", "2.01.04"),
+        "emprestimosOutrosLP": _dividas_fora_padrao(bpp, "2.02.", "2.02.01"),
         "patrimonioLiquido": valor_por_descricao(bpp, "2.", r"^Patrim.nio L.quido"),
         "capitalSocial": _capital(bpp),
         "fco": valor(dfc, "6.01"),
@@ -139,6 +142,29 @@ def extrair(bpa, bpp, dre, dfc, dva):
         "_lpaBasico": max([abs(v) for cd, (ds, v) in dre.items()
                            if cd.startswith("3.99.01.") and v] or [0]) or None,
     }
+
+
+# Contas cujo nome começa por empréstimo/financiamento/debênture; excluem-se itens que não são
+# dívida financeira tradicional (debêntures participativas, ajustes a valor justo, empréstimo
+# compulsório, refinanciamento fiscal e acordos com fornecedores).
+PADRAO_DIVIDA = re.compile(r"^\s*(empr[eé]stimos?|financiamentos?|deb[eê]ntures?|credores por financiamento)", re.I)
+EXCLUIR_DIVIDA = re.compile(r"compuls|participativ|ajuste|fiscal|fornecedor", re.I)
+
+
+def _dividas_fora_padrao(bpp, grupo, conta_padrao):
+    """Soma subcontas de empréstimos/financiamentos/debêntures que ficam fora da conta padrão
+    (ex.: dentro de 'Outras Obrigações'). Para não contar em dobro, usa só a conta mais alta
+    da hierarquia que casa com o padrão."""
+    candidatos = {cd: v for cd, (ds, v) in bpp.items()
+                  if cd.startswith(grupo) and not cd.startswith(conta_padrao)
+                  and PADRAO_DIVIDA.search(ds or "") and not EXCLUIR_DIVIDA.search(ds or "") and v}
+    total = 0.0
+    for cd, v in candidatos.items():
+        partes = cd.split(".")
+        ancestrais = [".".join(partes[:i]) for i in range(2, len(partes))]
+        if not any(a in candidatos for a in ancestrais):
+            total += v
+    return total or None
 
 
 def _capital(bpp):
@@ -222,6 +248,11 @@ def gerar(z_dfp, ano_dfp, mod_dfp, z_fca, ano_fca, mod_fca, z_fca_anterior=None)
             reg["contas_" + ordem] = extrair(g("BPA"), g("BPP"), g("DRE"), g("DFC_MI") or g("DFC_MD"), g("DVA"))
             reg["contas_" + ordem].pop("_lucroControladores", None)
             reg["contas_" + ordem].pop("_lpaBasico", None)
+        ct = reg["contas_t"]
+        if reg["estrutura"] == "padrao" and not ct.get("receita"):
+            reg["estrutura"] = "sem_receita"  # holdings/participações: sem receita operacional
+        divida = sum(abs(ct.get(k) or 0) for k in ("emprestimosCP", "emprestimosLP", "emprestimosOutrosCP", "emprestimosOutrosLP"))
+        reg["divida_identificada"] = divida > 0
         empresas[cnpj] = reg
 
     for r in linhas(z_dfp, nome_arquivo(z_dfp, "composicao_capital")):
